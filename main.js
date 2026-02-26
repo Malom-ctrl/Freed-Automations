@@ -157,7 +157,16 @@ class AutomationsPlugin {
         const feed = await this.api.data.getFeed(target.feedId);
         if (feed) tags = feed.tags || [];
       }
-      isMatch = tags.map((t) => t.toLowerCase()).includes(value);
+      let requiredTags = [];
+      try {
+        requiredTags = JSON.parse(condition.value);
+      } catch (e) {
+        requiredTags = condition.value ? [condition.value] : [];
+      }
+
+      isMatch = requiredTags.some((rt) =>
+        tags.map((t) => t.toLowerCase()).includes(rt.toLowerCase()),
+      );
     } else if (targetType === "article") {
       const title = (target.title || "").toLowerCase();
       const content = (
@@ -301,18 +310,33 @@ class AutomationsPlugin {
               }
               break;
             case "add_tag":
+              let tagsToAdd = [];
+              try {
+                tagsToAdd = JSON.parse(actionValue);
+              } catch (e) {
+                tagsToAdd = actionValue ? [actionValue] : [];
+              }
+
               if (targetType === "feed") {
                 if (!modifiedTarget.tags) modifiedTarget.tags = [];
-                if (!modifiedTarget.tags.includes(actionValue)) {
-                  modifiedTarget.tags.push(actionValue);
-                  modified = true;
-                }
+                tagsToAdd.forEach((t) => {
+                  if (!modifiedTarget.tags.includes(t)) {
+                    modifiedTarget.tags.push(t);
+                    modified = true;
+                  }
+                });
               } else if (targetType === "article") {
                 const feed = await this.api.data.getFeed(modifiedTarget.feedId);
                 if (feed) {
                   if (!feed.tags) feed.tags = [];
-                  if (!feed.tags.includes(actionValue)) {
-                    feed.tags.push(actionValue);
+                  let feedModified = false;
+                  tagsToAdd.forEach((t) => {
+                    if (!feed.tags.includes(t)) {
+                      feed.tags.push(t);
+                      feedModified = true;
+                    }
+                  });
+                  if (feedModified) {
                     await this.api.data.saveFeed(feed);
                     this.api.app.refresh();
                   }
@@ -320,22 +344,32 @@ class AutomationsPlugin {
               }
               break;
             case "remove_tag":
+              let tagsToRemove = [];
+              try {
+                tagsToRemove = JSON.parse(actionValue);
+              } catch (e) {
+                tagsToRemove = actionValue ? [actionValue] : [];
+              }
+
               if (targetType === "feed") {
-                if (
-                  modifiedTarget.tags &&
-                  modifiedTarget.tags.includes(actionValue)
-                ) {
+                if (modifiedTarget.tags) {
+                  const oldLen = modifiedTarget.tags.length;
                   modifiedTarget.tags = modifiedTarget.tags.filter(
-                    (t) => t !== actionValue,
+                    (t) => !tagsToRemove.includes(t),
                   );
-                  modified = true;
+                  if (modifiedTarget.tags.length !== oldLen) modified = true;
                 }
               } else if (targetType === "article") {
                 const feed = await this.api.data.getFeed(modifiedTarget.feedId);
-                if (feed && feed.tags && feed.tags.includes(actionValue)) {
-                  feed.tags = feed.tags.filter((t) => t !== actionValue);
-                  await this.api.data.saveFeed(feed);
-                  this.api.app.refresh();
+                if (feed && feed.tags) {
+                  const oldLen = feed.tags.length;
+                  feed.tags = feed.tags.filter(
+                    (t) => !tagsToRemove.includes(t),
+                  );
+                  if (feed.tags.length !== oldLen) {
+                    await this.api.data.saveFeed(feed);
+                    this.api.app.refresh();
+                  }
                 }
               }
               break;
@@ -367,6 +401,78 @@ class AutomationsPlugin {
     }
 
     return { target: modifiedTarget, modified };
+  }
+
+  renderTagInput(container, tagsArray, onChange, options = {}) {
+    this.emptyContainer(container);
+    container.className = "automation-tag-input-container";
+    container.style.display = "flex";
+    container.style.flexWrap = "wrap";
+    container.style.gap = "0.25rem";
+    container.style.border = "1px solid var(--border)";
+    container.style.padding = "0.25rem";
+    container.style.borderRadius = "4px";
+    container.style.background = "var(--bg-card)";
+    container.style.alignItems = "center";
+    container.style.flex = "1";
+
+    const renderPills = async () => {
+      // Remove existing pills
+      Array.from(container.querySelectorAll(".tag-pill")).forEach((p) =>
+        p.remove(),
+      );
+
+      for (let index = 0; index < tagsArray.length; index++) {
+        const tagName = tagsArray[index];
+        const tagObj = await this.api.data.getTag(tagName);
+
+        const pill = document.createElement("span");
+        pill.className = "tag-pill";
+        pill.style.setProperty(
+          "--tag-color",
+          tagObj ? tagObj.color : "var(--primary)",
+        );
+        pill.textContent = tagName;
+
+        const removeBtn = document.createElement("span");
+        removeBtn.className = "remove-tag";
+        removeBtn.textContent = "\u00D7";
+        removeBtn.onclick = (e) => {
+          e.stopPropagation();
+          tagsArray.splice(index, 1);
+          onChange(tagsArray);
+          renderPills();
+        };
+
+        pill.appendChild(removeBtn);
+        container.insertBefore(pill, input);
+      }
+    };
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Add tag...";
+    input.style.border = "none";
+    input.style.background = "transparent";
+    input.style.outline = "none";
+    input.style.flex = "1";
+    input.style.minWidth = "80px";
+    input.style.color = "var(--text-main)";
+
+    container.appendChild(input);
+    renderPills();
+
+    this.api.ui.utils.setupGenericTagInput(input, {
+      getExclusions: () => tagsArray.map((t) => t.name || t),
+      onlyExisting: options.onlyExisting || false,
+      onTagAdded: (newTag) => {
+        if (!tagsArray.find((t) => (t.name || t) === newTag.name)) {
+          tagsArray.push(newTag.name);
+          onChange(tagsArray);
+          renderPills();
+        }
+      },
+    });
   }
 
   emptyContainer(container) {
@@ -544,7 +650,32 @@ class AutomationsPlugin {
       this.createOption("scheduled", "Scheduled Time (Hourly)"),
     );
     eventSelect.value = currentRule.event;
-    eventSelect.onchange = (e) => (currentRule.event = e.target.value);
+    eventSelect.onchange = (e) => {
+      currentRule.event = e.target.value;
+      const isFeedEvent = ["feed_added", "feed_tag_added"].includes(
+        currentRule.event,
+      );
+
+      currentRule.conditions = currentRule.conditions.filter((c) => {
+        if (
+          isFeedEvent &&
+          ["content_contains", "feed_is", "has_media"].includes(c.field)
+        )
+          return false;
+        return true;
+      });
+      currentRule.actions = currentRule.actions.filter((a) => {
+        if (
+          isFeedEvent &&
+          ["discard", "mark_read", "favorite"].includes(a.type)
+        )
+          return false;
+        return true;
+      });
+
+      if (typeof renderConditions === "function") renderConditions();
+      if (typeof renderActions === "function") renderActions();
+    };
     eventBlock.appendChild(eventSelect);
     form.appendChild(eventBlock);
 
@@ -597,16 +728,30 @@ class AutomationsPlugin {
         select.appendChild(
           this.createOption("title_contains", "Title Contains"),
         );
-        select.appendChild(
-          this.createOption("content_contains", "Content Contains"),
-        );
         select.appendChild(this.createOption("url_contains", "URL Contains"));
-        select.appendChild(this.createOption("feed_is", "Feed Is"));
-        select.appendChild(
-          this.createOption("has_media", "Has Media (Audio/Video)"),
-        );
         select.appendChild(this.createOption("has_tag", "Has Tag"));
         select.appendChild(this.createOption("date_check", "Date Check"));
+
+        const isFeedEvent = ["feed_added", "feed_tag_added"].includes(
+          currentRule.event,
+        );
+        if (!isFeedEvent) {
+          select.appendChild(
+            this.createOption("content_contains", "Content Contains"),
+          );
+          select.appendChild(this.createOption("feed_is", "Feed Is"));
+          select.appendChild(
+            this.createOption("has_media", "Has Media (Audio/Video)"),
+          );
+        }
+
+        // Ensure current field is valid
+        if (
+          isFeedEvent &&
+          ["content_contains", "feed_is", "has_media"].includes(cond.field)
+        ) {
+          cond.field = "always";
+        }
         select.value = cond.field;
 
         const notBtn = document.createElement("button");
@@ -681,20 +826,37 @@ class AutomationsPlugin {
         dateCheckContainer.appendChild(dateOpSelect);
         dateCheckContainer.appendChild(dateValInput);
 
+        const tagInputContainer = document.createElement("div");
+        let tagsArray = [];
+        try {
+          tagsArray = cond.value ? JSON.parse(cond.value) : [];
+        } catch (e) {
+          tagsArray = cond.value ? [cond.value] : [];
+        }
+        this.renderTagInput(
+          tagInputContainer,
+          tagsArray,
+          (newTags) => {
+            cond.value = JSON.stringify(newTags);
+          },
+          { onlyExisting: true },
+        );
+
         const updateInputs = () => {
           valInput.classList.add("automation-hidden");
           feedSelect.classList.add("automation-hidden");
           dateCheckContainer.classList.add("automation-hidden");
+          tagInputContainer.classList.add("automation-hidden");
 
           if (
-            [
-              "title_contains",
-              "content_contains",
-              "url_contains",
-              "has_tag",
-            ].includes(select.value)
+            ["title_contains", "content_contains", "url_contains"].includes(
+              select.value,
+            )
           ) {
             valInput.classList.remove("automation-hidden");
+          } else if (select.value === "has_tag") {
+            tagInputContainer.classList.remove("automation-hidden");
+            cond.value = JSON.stringify(tagsArray);
           } else if (select.value === "feed_is") {
             feedSelect.classList.remove("automation-hidden");
             if (!cond.value && feeds.length > 0) {
@@ -729,6 +891,7 @@ class AutomationsPlugin {
         row.appendChild(valInput);
         row.appendChild(feedSelect);
         row.appendChild(dateCheckContainer);
+        row.appendChild(tagInputContainer);
         row.appendChild(delBtn);
 
         updateInputs();
@@ -774,9 +937,15 @@ class AutomationsPlugin {
         row.className = "automation-row";
 
         const select = document.createElement("select");
-        select.appendChild(this.createOption("discard", "Discard Article"));
-        select.appendChild(this.createOption("mark_read", "Mark as Read"));
-        select.appendChild(this.createOption("favorite", "Mark as Favorite"));
+        const isFeedEvent = ["feed_added", "feed_tag_added"].includes(
+          currentRule.event,
+        );
+
+        if (!isFeedEvent) {
+          select.appendChild(this.createOption("discard", "Discard Article"));
+          select.appendChild(this.createOption("mark_read", "Mark as Read"));
+          select.appendChild(this.createOption("favorite", "Mark as Favorite"));
+        }
         select.appendChild(this.createOption("add_tag", "Add Tag to Feed"));
         select.appendChild(
           this.createOption("remove_tag", "Remove Tag from Feed"),
@@ -785,6 +954,13 @@ class AutomationsPlugin {
         select.appendChild(
           this.createOption("trigger_webhook", "Trigger Webhook"),
         );
+
+        if (
+          isFeedEvent &&
+          ["discard", "mark_read", "favorite"].includes(act.type)
+        ) {
+          act.type = "notify";
+        }
         select.value = act.type;
 
         const valInput = document.createElement("input");
@@ -793,20 +969,41 @@ class AutomationsPlugin {
         valInput.value = act.value;
         valInput.oninput = (e) => (act.value = e.target.value);
 
+        const tagInputContainer = document.createElement("div");
+        let tagsArray = [];
+        try {
+          tagsArray = act.value ? JSON.parse(act.value) : [];
+        } catch (e) {
+          tagsArray = act.value ? [act.value] : [];
+        }
+
+        const updateTagInput = () => {
+          this.renderTagInput(
+            tagInputContainer,
+            tagsArray,
+            (newTags) => {
+              act.value = JSON.stringify(newTags);
+            },
+            { onlyExisting: select.value === "remove_tag" },
+          );
+        };
+        updateTagInput();
+
         const updateInputs = () => {
           valInput.classList.add("automation-hidden");
-          if (
-            ["notify", "add_tag", "remove_tag", "trigger_webhook"].includes(
-              select.value,
-            )
-          ) {
+          tagInputContainer.classList.add("automation-hidden");
+
+          if (["add_tag", "remove_tag"].includes(select.value)) {
+            tagInputContainer.classList.remove("automation-hidden");
+            act.value = JSON.stringify(tagsArray);
+            updateTagInput(); // Re-render to update onlyExisting based on selection
+          } else if (["notify", "trigger_webhook"].includes(select.value)) {
             valInput.classList.remove("automation-hidden");
             if (select.value === "notify")
               valInput.placeholder =
                 "Notification text... (use {{article.title}})";
             else if (select.value === "trigger_webhook")
               valInput.placeholder = "Webhook URL...";
-            else valInput.placeholder = "Tag name...";
           } else {
             act.value = "";
           }
@@ -827,6 +1024,7 @@ class AutomationsPlugin {
 
         row.appendChild(select);
         row.appendChild(valInput);
+        row.appendChild(tagInputContainer);
         row.appendChild(delBtn);
 
         updateInputs();
