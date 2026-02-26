@@ -4,5 +4,5 @@
   "version": "0.0.4",
   "description": "Create automations based on events and conditions.",
   "compatibleAppVersion": ">=1.4.3",
-  "files": ["main.js", "styles.css"]
+  "files": ["registry.js", "definitions.js", "main.js", "styles.css"]
 }

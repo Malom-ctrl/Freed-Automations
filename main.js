@@ -3,9 +3,16 @@ class AutomationsPlugin {
     this.api = api;
     this.rules = [];
     this.intervalId = null;
+    this.registry = null;
   }
 
   async activate() {
+    const AutomationRegistry = this.api.namespace.get("AutomationRegistry");
+    const registerDefinitions = this.api.namespace.get("registerDefinitions");
+
+    this.registry = new AutomationRegistry();
+    registerDefinitions(this.registry, this.api);
+
     this.rules = (await this.api.storage.get("rules")) || [];
 
     this.api.ui.settings.addTab("automations", "Automations", (container) => {
@@ -106,119 +113,6 @@ class AutomationsPlugin {
     }
   }
 
-  async evaluateCondition(condition, target, targetType, extraContext) {
-    const value = condition.value ? condition.value.toLowerCase() : "";
-
-    let isMatch = false;
-    let matchContext = "";
-
-    if (condition.field === "always") {
-      isMatch = true;
-    } else if (condition.field === "date_check") {
-      const [operator, ...rest] = (condition.value || "").split(":");
-      const dateVal = rest.join(":");
-      const targetDate = new Date(
-        targetType === "article"
-          ? target.pubDate
-          : target.addedAt || Date.now(),
-      );
-      const now = new Date();
-
-      if (operator === "more_recent_than") {
-        const days = parseInt(dateVal, 10);
-        if (!isNaN(days)) {
-          const diffTime = Math.abs(now - targetDate);
-          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-          isMatch = diffDays <= days;
-        }
-      } else if (operator === "older_than") {
-        const days = parseInt(dateVal, 10);
-        if (!isNaN(days)) {
-          const diffTime = Math.abs(now - targetDate);
-          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-          isMatch = diffDays > days;
-        }
-      } else if (operator === "before") {
-        const compareDate = new Date(dateVal);
-        if (!isNaN(compareDate)) {
-          isMatch = targetDate < compareDate;
-        }
-      } else if (operator === "after") {
-        const compareDate = new Date(dateVal);
-        if (!isNaN(compareDate)) {
-          isMatch = targetDate > compareDate;
-        }
-      }
-    } else if (condition.field === "has_tag") {
-      let tags = [];
-      if (targetType === "feed") {
-        tags = target.tags || [];
-      } else if (targetType === "article") {
-        const feed = await this.api.data.getFeed(target.feedId);
-        if (feed) tags = feed.tags || [];
-      }
-      let requiredTags = [];
-      try {
-        requiredTags = JSON.parse(condition.value);
-      } catch (e) {
-        requiredTags = condition.value ? [condition.value] : [];
-      }
-
-      isMatch = requiredTags.some((rt) =>
-        tags.map((t) => t.toLowerCase()).includes(rt.toLowerCase()),
-      );
-    } else if (targetType === "article") {
-      const title = (target.title || "").toLowerCase();
-      const content = (
-        (target.content || "") +
-        " " +
-        (target.snippet || "")
-      ).toLowerCase();
-      const url = (target.link || "").toLowerCase();
-
-      switch (condition.field) {
-        case "title_contains":
-          isMatch = title.includes(value);
-          if (isMatch) matchContext = value;
-          break;
-        case "content_contains":
-          isMatch = content.includes(value);
-          if (isMatch) matchContext = value;
-          break;
-        case "url_contains":
-          isMatch = url.includes(value);
-          if (isMatch) matchContext = value;
-          break;
-        case "feed_is":
-          isMatch = target.feedId === condition.value;
-          break;
-        case "has_media":
-          isMatch = !!target.mediaType;
-          break;
-      }
-    } else if (targetType === "feed") {
-      const title = (target.title || "").toLowerCase();
-      const url = (target.url || "").toLowerCase();
-      switch (condition.field) {
-        case "title_contains":
-          isMatch = title.includes(value);
-          if (isMatch) matchContext = value;
-          break;
-        case "url_contains":
-          isMatch = url.includes(value);
-          if (isMatch) matchContext = value;
-          break;
-      }
-    }
-
-    if (condition.invert) {
-      isMatch = !isMatch;
-      matchContext = ""; // Inverted matches don't provide context
-    }
-
-    return { isMatch, matchContext };
-  }
-
   replaceVariables(text, target, targetType, matchContext, extraContext) {
     if (!text) return "";
     let res = text.replace(/\{\{condition\.match\}\}/g, matchContext || "");
@@ -244,6 +138,9 @@ class AutomationsPlugin {
     for (const rule of this.rules) {
       if (rule.event !== eventType) continue;
 
+      const eventDef = this.registry.getEvent(rule.event);
+      if (!eventDef) continue;
+
       let ruleMatched = false;
       let ruleMatchContext = "";
 
@@ -252,14 +149,19 @@ class AutomationsPlugin {
       } else {
         let matches = [];
         for (const cond of rule.conditions) {
-          matches.push(
-            await this.evaluateCondition(
-              cond,
-              modifiedTarget,
-              targetType,
-              extraContext,
-            ),
+          const condDef = this.registry.getCondition(cond.field);
+          if (!condDef) continue;
+
+          const res = await condDef.evaluate(
+            modifiedTarget,
+            cond.value,
+            extraContext,
           );
+          if (cond.invert) {
+            res.isMatch = !res.isMatch;
+            res.matchContext = "";
+          }
+          matches.push(res);
         }
 
         if (rule.matchType === "any") {
@@ -272,7 +174,6 @@ class AutomationsPlugin {
           // "all"
           ruleMatched = matches.every((m) => m.isMatch);
           if (ruleMatched) {
-            // Combine contexts or just take the first non-empty one
             const firstContext = matches.find((m) => m.matchContext);
             if (firstContext) ruleMatchContext = firstContext.matchContext;
           }
@@ -281,6 +182,9 @@ class AutomationsPlugin {
 
       if (ruleMatched) {
         for (const action of rule.actions) {
+          const actionDef = this.registry.getAction(action.type);
+          if (!actionDef) continue;
+
           const actionValue = this.replaceVariables(
             action.value,
             modifiedTarget,
@@ -289,190 +193,19 @@ class AutomationsPlugin {
             extraContext,
           );
 
-          switch (action.type) {
-            case "discard":
-              if (targetType === "article") {
-                modifiedTarget.discarded = true;
-                modified = true;
-              }
-              break;
-            case "mark_read":
-              if (targetType === "article") {
-                modifiedTarget.readingProgress = 1;
-                modifiedTarget.read = true;
-                modified = true;
-              }
-              break;
-            case "favorite":
-              if (targetType === "article") {
-                modifiedTarget.favorite = true;
-                modified = true;
-              }
-              break;
-            case "add_tag":
-              let tagsToAdd = [];
-              try {
-                tagsToAdd = JSON.parse(actionValue);
-              } catch (e) {
-                tagsToAdd = actionValue ? [actionValue] : [];
-              }
-
-              if (targetType === "feed") {
-                if (!modifiedTarget.tags) modifiedTarget.tags = [];
-                tagsToAdd.forEach((t) => {
-                  if (!modifiedTarget.tags.includes(t)) {
-                    modifiedTarget.tags.push(t);
-                    modified = true;
-                  }
-                });
-              } else if (targetType === "article") {
-                const feed = await this.api.data.getFeed(modifiedTarget.feedId);
-                if (feed) {
-                  if (!feed.tags) feed.tags = [];
-                  let feedModified = false;
-                  tagsToAdd.forEach((t) => {
-                    if (!feed.tags.includes(t)) {
-                      feed.tags.push(t);
-                      feedModified = true;
-                    }
-                  });
-                  if (feedModified) {
-                    await this.api.data.saveFeed(feed);
-                    this.api.app.refresh();
-                  }
-                }
-              }
-              break;
-            case "remove_tag":
-              let tagsToRemove = [];
-              try {
-                tagsToRemove = JSON.parse(actionValue);
-              } catch (e) {
-                tagsToRemove = actionValue ? [actionValue] : [];
-              }
-
-              if (targetType === "feed") {
-                if (modifiedTarget.tags) {
-                  const oldLen = modifiedTarget.tags.length;
-                  modifiedTarget.tags = modifiedTarget.tags.filter(
-                    (t) => !tagsToRemove.includes(t),
-                  );
-                  if (modifiedTarget.tags.length !== oldLen) modified = true;
-                }
-              } else if (targetType === "article") {
-                const feed = await this.api.data.getFeed(modifiedTarget.feedId);
-                if (feed && feed.tags) {
-                  const oldLen = feed.tags.length;
-                  feed.tags = feed.tags.filter(
-                    (t) => !tagsToRemove.includes(t),
-                  );
-                  if (feed.tags.length !== oldLen) {
-                    await this.api.data.saveFeed(feed);
-                    this.api.app.refresh();
-                  }
-                }
-              }
-              break;
-            case "notify":
-              this.api.ui.toast(
-                actionValue || `Automation: ${rule.name} triggered`,
-              );
-              break;
-            case "trigger_webhook":
-              try {
-                await fetch(actionValue, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    event: eventType,
-                    rule: rule.name,
-                    targetType,
-                    target: modifiedTarget,
-                    extraContext,
-                  }),
-                });
-              } catch (e) {
-                console.error("Webhook failed", e);
-              }
-              break;
-          }
+          const res = await actionDef.execute(
+            modifiedTarget,
+            actionValue,
+            extraContext,
+            rule.name,
+            eventType,
+          );
+          if (res && res.modified) modified = true;
         }
       }
     }
 
     return { target: modifiedTarget, modified };
-  }
-
-  renderTagInput(container, tagsArray, onChange, options = {}) {
-    this.emptyContainer(container);
-    container.className = "automation-tag-input-container";
-    container.style.display = "flex";
-    container.style.flexWrap = "wrap";
-    container.style.gap = "0.25rem";
-    container.style.border = "1px solid var(--border)";
-    container.style.padding = "0.25rem";
-    container.style.borderRadius = "4px";
-    container.style.background = "var(--bg-card)";
-    container.style.alignItems = "center";
-    container.style.flex = "1";
-
-    const renderPills = async () => {
-      // Remove existing pills
-      Array.from(container.querySelectorAll(".tag-pill")).forEach((p) =>
-        p.remove(),
-      );
-
-      for (let index = 0; index < tagsArray.length; index++) {
-        const tagName = tagsArray[index];
-        const tagObj = await this.api.data.getTag(tagName);
-
-        const pill = document.createElement("span");
-        pill.className = "tag-pill";
-        pill.style.setProperty(
-          "--tag-color",
-          tagObj ? tagObj.color : "var(--primary)",
-        );
-        pill.textContent = tagName;
-
-        const removeBtn = document.createElement("span");
-        removeBtn.className = "remove-tag";
-        removeBtn.textContent = "\u00D7";
-        removeBtn.onclick = (e) => {
-          e.stopPropagation();
-          tagsArray.splice(index, 1);
-          onChange(tagsArray);
-          renderPills();
-        };
-
-        pill.appendChild(removeBtn);
-        container.insertBefore(pill, input);
-      }
-    };
-
-    const input = document.createElement("input");
-    input.type = "text";
-    input.placeholder = "Add tag...";
-    input.style.border = "none";
-    input.style.background = "transparent";
-    input.style.outline = "none";
-    input.style.flex = "1";
-    input.style.minWidth = "80px";
-    input.style.color = "var(--text-main)";
-
-    container.appendChild(input);
-    renderPills();
-
-    this.api.ui.utils.setupGenericTagInput(input, {
-      getExclusions: () => tagsArray.map((t) => t.name || t),
-      onlyExisting: options.onlyExisting || false,
-      onTagAdded: (newTag) => {
-        if (!tagsArray.find((t) => (t.name || t) === newTag.name)) {
-          tagsArray.push(newTag.name);
-          onChange(tagsArray);
-          renderPills();
-        }
-      },
-    });
   }
 
   emptyContainer(container) {
@@ -486,6 +219,15 @@ class AutomationsPlugin {
     opt.value = value;
     opt.textContent = text;
     return opt;
+  }
+
+  createFormGroup(label) {
+    const group = document.createElement("div");
+    group.className = "automation-form-group";
+    const lbl = document.createElement("label");
+    lbl.textContent = label;
+    group.appendChild(lbl);
+    return group;
   }
 
   async renderSettings(container) {
@@ -556,14 +298,8 @@ class AutomationsPlugin {
       const details = document.createElement("div");
       details.className = "automation-rule-details";
 
-      const eventNames = {
-        new_article: "New Article Fetched",
-        article_favorited: "Article Favorited",
-        article_read: "Article Read",
-        feed_added: "Feed Added",
-        feed_tag_added: "Tag Added to Feed",
-        scheduled: "Scheduled Time",
-      };
+      const eventDef = this.registry.getEvent(rule.event);
+      const eventName = eventDef ? eventDef.label : rule.event;
 
       let condText =
         rule.conditions.length +
@@ -574,7 +310,7 @@ class AutomationsPlugin {
         " action" +
         (rule.actions.length !== 1 ? "s" : "");
 
-      details.textContent = `When ${eventNames[rule.event] || rule.event} • ${condText} • ${actText}`;
+      details.textContent = `When ${eventName} • ${condText} • ${actText}`;
 
       card.appendChild(cardHeader);
       card.appendChild(details);
@@ -635,47 +371,11 @@ class AutomationsPlugin {
     eventBlock.appendChild(eventTitle);
 
     const eventSelect = document.createElement("select");
-    eventSelect.appendChild(
-      this.createOption("new_article", "New Article Fetched"),
-    );
-    eventSelect.appendChild(
-      this.createOption("article_favorited", "Article Favorited"),
-    );
-    eventSelect.appendChild(this.createOption("article_read", "Article Read"));
-    eventSelect.appendChild(this.createOption("feed_added", "Feed Added"));
-    eventSelect.appendChild(
-      this.createOption("feed_tag_added", "Tag Added to Feed"),
-    );
-    eventSelect.appendChild(
-      this.createOption("scheduled", "Scheduled Time (Hourly)"),
-    );
+    const events = this.registry.getEvents();
+    events.forEach((ev) => {
+      eventSelect.appendChild(this.createOption(ev.id, ev.label));
+    });
     eventSelect.value = currentRule.event;
-    eventSelect.onchange = (e) => {
-      currentRule.event = e.target.value;
-      const isFeedEvent = ["feed_added", "feed_tag_added"].includes(
-        currentRule.event,
-      );
-
-      currentRule.conditions = currentRule.conditions.filter((c) => {
-        if (
-          isFeedEvent &&
-          ["content_contains", "feed_is", "has_media"].includes(c.field)
-        )
-          return false;
-        return true;
-      });
-      currentRule.actions = currentRule.actions.filter((a) => {
-        if (
-          isFeedEvent &&
-          ["discard", "mark_read", "favorite"].includes(a.type)
-        )
-          return false;
-        return true;
-      });
-
-      if (typeof renderConditions === "function") renderConditions();
-      if (typeof renderActions === "function") renderActions();
-    };
     eventBlock.appendChild(eventSelect);
     form.appendChild(eventBlock);
 
@@ -713,44 +413,25 @@ class AutomationsPlugin {
     conditionsList.style.gap = "0.5rem";
     conditionsBlock.appendChild(conditionsList);
 
-    const feeds = await this.api.data.getAllFeeds();
-
     const renderConditions = () => {
       this.emptyContainer(conditionsList);
+
+      const eventDef = this.registry.getEvent(currentRule.event);
+      const targetType = eventDef ? eventDef.targetType : "article";
+      const availableConditions = this.registry.getConditions(targetType);
+
       currentRule.conditions.forEach((cond, index) => {
         const row = document.createElement("div");
         row.className = "automation-row";
 
         const select = document.createElement("select");
-        select.appendChild(
-          this.createOption("always", "Always (No Condition)"),
-        );
-        select.appendChild(
-          this.createOption("title_contains", "Title Contains"),
-        );
-        select.appendChild(this.createOption("url_contains", "URL Contains"));
-        select.appendChild(this.createOption("has_tag", "Has Tag"));
-        select.appendChild(this.createOption("date_check", "Date Check"));
+        availableConditions.forEach((c) => {
+          select.appendChild(this.createOption(c.id, c.label));
+        });
 
-        const isFeedEvent = ["feed_added", "feed_tag_added"].includes(
-          currentRule.event,
-        );
-        if (!isFeedEvent) {
-          select.appendChild(
-            this.createOption("content_contains", "Content Contains"),
-          );
-          select.appendChild(this.createOption("feed_is", "Feed Is"));
-          select.appendChild(
-            this.createOption("has_media", "Has Media (Audio/Video)"),
-          );
-        }
-
-        // Ensure current field is valid
-        if (
-          isFeedEvent &&
-          ["content_contains", "feed_is", "has_media"].includes(cond.field)
-        ) {
-          cond.field = "always";
+        // Ensure valid field
+        if (!availableConditions.find((c) => c.id === cond.field)) {
+          cond.field = availableConditions[0].id;
         }
         select.value = cond.field;
 
@@ -763,119 +444,32 @@ class AutomationsPlugin {
           notBtn.className = "btn-not" + (cond.invert ? " active" : "");
         };
 
-        const valInput = document.createElement("input");
-        valInput.type = "text";
-        valInput.placeholder = "Value...";
-        valInput.value = cond.value;
-        valInput.oninput = (e) => (cond.value = e.target.value);
+        const inputContainer = document.createElement("div");
+        inputContainer.style.flex = "1";
+        inputContainer.style.display = "flex";
 
-        const feedSelect = document.createElement("select");
-        feeds.forEach((f) =>
-          feedSelect.appendChild(this.createOption(f.id, f.title)),
-        );
-        feedSelect.value = cond.value;
-        feedSelect.onchange = (e) => (cond.value = e.target.value);
-
-        const dateCheckContainer = document.createElement("div");
-        dateCheckContainer.className = "automation-row";
-        dateCheckContainer.style.flex = "1";
-        const dateOpSelect = document.createElement("select");
-        dateOpSelect.appendChild(
-          this.createOption("more_recent_than", "More recent than (days)"),
-        );
-        dateOpSelect.appendChild(
-          this.createOption("older_than", "Older than (days)"),
-        );
-        dateOpSelect.appendChild(this.createOption("before", "Before date"));
-        dateOpSelect.appendChild(this.createOption("after", "After date"));
-
-        const dateValInput = document.createElement("input");
-        dateValInput.type = "text";
-
-        let [dateOp, ...dateRest] = (cond.value || "").split(":");
-        if (
-          !["more_recent_than", "older_than", "before", "after"].includes(
-            dateOp,
-          )
-        ) {
-          dateOp = "more_recent_than";
-          dateRest = [""];
-        }
-        dateOpSelect.value = dateOp;
-        dateValInput.value = dateRest.join(":");
-
-        const updateDateValue = () => {
-          cond.value = `${dateOpSelect.value}:${dateValInput.value}`;
-        };
-        dateOpSelect.onchange = (e) => {
-          if (["before", "after"].includes(e.target.value)) {
-            dateValInput.type = "date";
+        const renderInput = () => {
+          this.emptyContainer(inputContainer);
+          const condDef = this.registry.getCondition(cond.field);
+          if (condDef && condDef.renderInput) {
+            condDef.renderInput(inputContainer, cond.value, (newVal) => {
+              cond.value = newVal;
+            });
           } else {
-            dateValInput.type = "number";
-          }
-          updateDateValue();
-        };
-        dateValInput.oninput = updateDateValue;
-
-        if (["before", "after"].includes(dateOp)) {
-          dateValInput.type = "date";
-        } else {
-          dateValInput.type = "number";
-        }
-
-        dateCheckContainer.appendChild(dateOpSelect);
-        dateCheckContainer.appendChild(dateValInput);
-
-        const tagInputContainer = document.createElement("div");
-        let tagsArray = [];
-        try {
-          tagsArray = cond.value ? JSON.parse(cond.value) : [];
-        } catch (e) {
-          tagsArray = cond.value ? [cond.value] : [];
-        }
-        this.renderTagInput(
-          tagInputContainer,
-          tagsArray,
-          (newTags) => {
-            cond.value = JSON.stringify(newTags);
-          },
-          { onlyExisting: true },
-        );
-
-        const updateInputs = () => {
-          valInput.classList.add("automation-hidden");
-          feedSelect.classList.add("automation-hidden");
-          dateCheckContainer.classList.add("automation-hidden");
-          tagInputContainer.classList.add("automation-hidden");
-
-          if (
-            ["title_contains", "content_contains", "url_contains"].includes(
-              select.value,
-            )
-          ) {
-            valInput.classList.remove("automation-hidden");
-          } else if (select.value === "has_tag") {
-            tagInputContainer.classList.remove("automation-hidden");
-            cond.value = JSON.stringify(tagsArray);
-          } else if (select.value === "feed_is") {
-            feedSelect.classList.remove("automation-hidden");
-            if (!cond.value && feeds.length > 0) {
-              cond.value = feeds[0].id;
-              feedSelect.value = feeds[0].id;
-            } else {
-              feedSelect.value = cond.value;
-            }
-          } else if (select.value === "date_check") {
-            dateCheckContainer.classList.remove("automation-hidden");
-            updateDateValue();
-          } else {
-            cond.value = "";
+            const valInput = document.createElement("input");
+            valInput.type = "text";
+            valInput.placeholder = "Value...";
+            valInput.value = cond.value || "";
+            valInput.style.width = "100%";
+            valInput.oninput = (e) => (cond.value = e.target.value);
+            inputContainer.appendChild(valInput);
           }
         };
 
         select.onchange = (e) => {
           cond.field = e.target.value;
-          updateInputs();
+          cond.value = ""; // Reset value on type change
+          renderInput();
         };
 
         const delBtn = document.createElement("button");
@@ -888,26 +482,25 @@ class AutomationsPlugin {
 
         row.appendChild(notBtn);
         row.appendChild(select);
-        row.appendChild(valInput);
-        row.appendChild(feedSelect);
-        row.appendChild(dateCheckContainer);
-        row.appendChild(tagInputContainer);
+        row.appendChild(inputContainer);
         row.appendChild(delBtn);
 
-        updateInputs();
+        renderInput();
         conditionsList.appendChild(row);
       });
     };
-
-    renderConditions();
 
     const addCondBtn = document.createElement("button");
     addCondBtn.className = "btn btn-outline automation-btn-add";
     addCondBtn.textContent = "+ Add Condition";
     addCondBtn.onclick = () => {
+      const eventDef = this.registry.getEvent(currentRule.event);
+      const targetType = eventDef ? eventDef.targetType : "article";
+      const availableConditions = this.registry.getConditions(targetType);
+
       currentRule.conditions.push({
         id: this.api.ui.utils.generateId(),
-        field: "title_contains",
+        field: availableConditions[0].id,
         invert: false,
         value: "",
       });
@@ -932,86 +525,51 @@ class AutomationsPlugin {
 
     const renderActions = () => {
       this.emptyContainer(actionsList);
+
+      const eventDef = this.registry.getEvent(currentRule.event);
+      const targetType = eventDef ? eventDef.targetType : "article";
+      const availableActions = this.registry.getActions(targetType);
+
       currentRule.actions.forEach((act, index) => {
         const row = document.createElement("div");
         row.className = "automation-row";
 
         const select = document.createElement("select");
-        const isFeedEvent = ["feed_added", "feed_tag_added"].includes(
-          currentRule.event,
-        );
+        availableActions.forEach((a) => {
+          select.appendChild(this.createOption(a.id, a.label));
+        });
 
-        if (!isFeedEvent) {
-          select.appendChild(this.createOption("discard", "Discard Article"));
-          select.appendChild(this.createOption("mark_read", "Mark as Read"));
-          select.appendChild(this.createOption("favorite", "Mark as Favorite"));
-        }
-        select.appendChild(this.createOption("add_tag", "Add Tag to Feed"));
-        select.appendChild(
-          this.createOption("remove_tag", "Remove Tag from Feed"),
-        );
-        select.appendChild(this.createOption("notify", "Show Notification"));
-        select.appendChild(
-          this.createOption("trigger_webhook", "Trigger Webhook"),
-        );
-
-        if (
-          isFeedEvent &&
-          ["discard", "mark_read", "favorite"].includes(act.type)
-        ) {
-          act.type = "notify";
+        if (!availableActions.find((a) => a.id === act.type)) {
+          act.type = availableActions[0].id;
         }
         select.value = act.type;
 
-        const valInput = document.createElement("input");
-        valInput.type = "text";
-        valInput.placeholder = "Value...";
-        valInput.value = act.value;
-        valInput.oninput = (e) => (act.value = e.target.value);
+        const inputContainer = document.createElement("div");
+        inputContainer.style.flex = "1";
+        inputContainer.style.display = "flex";
 
-        const tagInputContainer = document.createElement("div");
-        let tagsArray = [];
-        try {
-          tagsArray = act.value ? JSON.parse(act.value) : [];
-        } catch (e) {
-          tagsArray = act.value ? [act.value] : [];
-        }
-
-        const updateTagInput = () => {
-          this.renderTagInput(
-            tagInputContainer,
-            tagsArray,
-            (newTags) => {
-              act.value = JSON.stringify(newTags);
-            },
-            { onlyExisting: select.value === "remove_tag" },
-          );
-        };
-        updateTagInput();
-
-        const updateInputs = () => {
-          valInput.classList.add("automation-hidden");
-          tagInputContainer.classList.add("automation-hidden");
-
-          if (["add_tag", "remove_tag"].includes(select.value)) {
-            tagInputContainer.classList.remove("automation-hidden");
-            act.value = JSON.stringify(tagsArray);
-            updateTagInput(); // Re-render to update onlyExisting based on selection
-          } else if (["notify", "trigger_webhook"].includes(select.value)) {
-            valInput.classList.remove("automation-hidden");
-            if (select.value === "notify")
-              valInput.placeholder =
-                "Notification text... (use {{article.title}})";
-            else if (select.value === "trigger_webhook")
-              valInput.placeholder = "Webhook URL...";
+        const renderInput = () => {
+          this.emptyContainer(inputContainer);
+          const actDef = this.registry.getAction(act.type);
+          if (actDef && actDef.renderInput) {
+            actDef.renderInput(inputContainer, act.value, (newVal) => {
+              act.value = newVal;
+            });
           } else {
-            act.value = "";
+            const valInput = document.createElement("input");
+            valInput.type = "text";
+            valInput.placeholder = "Value...";
+            valInput.value = act.value || "";
+            valInput.style.width = "100%";
+            valInput.oninput = (e) => (act.value = e.target.value);
+            inputContainer.appendChild(valInput);
           }
         };
 
         select.onchange = (e) => {
           act.type = e.target.value;
-          updateInputs();
+          act.value = "";
+          renderInput();
         };
 
         const delBtn = document.createElement("button");
@@ -1023,24 +581,25 @@ class AutomationsPlugin {
         };
 
         row.appendChild(select);
-        row.appendChild(valInput);
-        row.appendChild(tagInputContainer);
+        row.appendChild(inputContainer);
         row.appendChild(delBtn);
 
-        updateInputs();
+        renderInput();
         actionsList.appendChild(row);
       });
     };
-
-    renderActions();
 
     const addActBtn = document.createElement("button");
     addActBtn.className = "btn btn-outline automation-btn-add";
     addActBtn.textContent = "+ Add Action";
     addActBtn.onclick = () => {
+      const eventDef = this.registry.getEvent(currentRule.event);
+      const targetType = eventDef ? eventDef.targetType : "article";
+      const availableActions = this.registry.getActions(targetType);
+
       currentRule.actions.push({
         id: this.api.ui.utils.generateId(),
-        type: "discard",
+        type: availableActions[0].id,
         value: "",
       });
       renderActions();
@@ -1048,27 +607,54 @@ class AutomationsPlugin {
     actionsBlock.appendChild(addActBtn);
     form.appendChild(actionsBlock);
 
-    // Save/Cancel Buttons
-    const actions = document.createElement("div");
-    actions.className = "automation-actions";
+    // Initial Render
+    renderConditions();
+    renderActions();
+
+    // Event Change Handler
+    eventSelect.onchange = (e) => {
+      currentRule.event = e.target.value;
+
+      // Filter incompatible conditions/actions
+      const eventDef = this.registry.getEvent(currentRule.event);
+      if (eventDef) {
+        const targetType = eventDef.targetType;
+
+        currentRule.conditions = currentRule.conditions.filter((c) => {
+          const cDef = this.registry.getCondition(c.field);
+          return (
+            cDef &&
+            (!cDef.compatibleTargetTypes ||
+              cDef.compatibleTargetTypes.includes(targetType))
+          );
+        });
+
+        currentRule.actions = currentRule.actions.filter((a) => {
+          const aDef = this.registry.getAction(a.type);
+          return (
+            aDef &&
+            (!aDef.compatibleTargetTypes ||
+              aDef.compatibleTargetTypes.includes(targetType))
+          );
+        });
+      }
+
+      renderConditions();
+      renderActions();
+    };
+
+    // Save/Cancel
+    const footer = document.createElement("div");
+    footer.className = "automation-footer";
 
     const saveBtn = document.createElement("button");
     saveBtn.className = "btn btn-primary";
     saveBtn.textContent = "Save Rule";
     saveBtn.onclick = async () => {
-      if (!currentRule.name.trim()) {
-        this.api.ui.toast("Please enter a rule name.");
+      if (!currentRule.name) {
+        this.api.ui.toast("Rule name is required");
         return;
       }
-      if (currentRule.conditions.length === 0) {
-        this.api.ui.toast("Please add at least one condition.");
-        return;
-      }
-      if (currentRule.actions.length === 0) {
-        this.api.ui.toast("Please add at least one action.");
-        return;
-      }
-
       if (isNew) {
         this.rules.push(currentRule);
       } else {
@@ -1077,7 +663,6 @@ class AutomationsPlugin {
       }
       await this.saveRules();
       this.renderSettings(container);
-      this.api.ui.toast("Rule saved.");
     };
 
     const cancelBtn = document.createElement("button");
@@ -1085,20 +670,11 @@ class AutomationsPlugin {
     cancelBtn.textContent = "Cancel";
     cancelBtn.onclick = () => this.renderSettings(container);
 
-    actions.appendChild(cancelBtn);
-    actions.appendChild(saveBtn);
-    form.appendChild(actions);
+    footer.appendChild(cancelBtn);
+    footer.appendChild(saveBtn);
+    form.appendChild(footer);
 
     container.appendChild(form);
-  }
-
-  createFormGroup(labelText) {
-    const group = document.createElement("div");
-    group.className = "automation-form-group";
-    const label = document.createElement("label");
-    label.textContent = labelText;
-    group.appendChild(label);
-    return group;
   }
 }
 
