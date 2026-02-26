@@ -418,7 +418,13 @@ class AutomationsPlugin {
 
       const eventDef = this.registry.getEvent(currentRule.event);
       const targetType = eventDef ? eventDef.targetType : "article";
-      const availableConditions = this.registry.getConditions(targetType);
+      let availableConditions = this.registry.getConditions(targetType);
+
+      // Filter by compatibleEvents if specified
+      availableConditions = availableConditions.filter(
+        (c) =>
+          !c.compatibleEvents || c.compatibleEvents.includes(currentRule.event),
+      );
 
       currentRule.conditions.forEach((cond, index) => {
         const row = document.createElement("div");
@@ -496,7 +502,12 @@ class AutomationsPlugin {
     addCondBtn.onclick = () => {
       const eventDef = this.registry.getEvent(currentRule.event);
       const targetType = eventDef ? eventDef.targetType : "article";
-      const availableConditions = this.registry.getConditions(targetType);
+      let availableConditions = this.registry.getConditions(targetType);
+
+      availableConditions = availableConditions.filter(
+        (c) =>
+          !c.compatibleEvents || c.compatibleEvents.includes(currentRule.event),
+      );
 
       currentRule.conditions.push({
         id: this.api.ui.utils.generateId(),
@@ -625,7 +636,9 @@ class AutomationsPlugin {
           return (
             cDef &&
             (!cDef.compatibleTargetTypes ||
-              cDef.compatibleTargetTypes.includes(targetType))
+              cDef.compatibleTargetTypes.includes(targetType)) &&
+            (!cDef.compatibleEvents ||
+              cDef.compatibleEvents.includes(currentRule.event))
           );
         });
 

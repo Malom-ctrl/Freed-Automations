@@ -219,6 +219,32 @@ export async function activate(api) {
     });
 
     registry.registerCondition({
+      id: "added_tag_is",
+      label: "Added Tag Is",
+      compatibleTargetTypes: ["feed"],
+      compatibleEvents: ["feed_tag_added"],
+      evaluate: (target, value, extraContext) => {
+        const addedTag = extraContext && extraContext.tag;
+        if (!addedTag) return { isMatch: false };
+
+        let requiredTags = [];
+        try {
+          requiredTags = JSON.parse(value);
+        } catch (e) {
+          requiredTags = value ? [value] : [];
+        }
+
+        const isMatch = requiredTags.some(
+          (rt) => rt.toLowerCase() === addedTag.toLowerCase(),
+        );
+        return { isMatch };
+      },
+      renderInput: (container, value, onChange) => {
+        renderTagInput(container, value, onChange, { onlyExisting: true });
+      },
+    });
+
+    registry.registerCondition({
       id: "date_check",
       label: "Date Check",
       compatibleTargetTypes: ["article", "feed"],
