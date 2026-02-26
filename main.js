@@ -29,6 +29,16 @@ class AutomationsPlugin {
       await this.processSingleArticleEvent(guid, "article_read");
     });
 
+    this.api.events.on("freed:feed-added", async ({ feed }) => {
+      await this.processSingleFeedEvent(feed, "feed_added");
+    });
+
+    this.api.events.on("freed:feed-tag-added", async ({ feedId, tag }) => {
+      const feed = await this.api.data.getFeed(feedId);
+      if (feed)
+        await this.processSingleFeedEvent(feed, "feed_tag_added", { tag });
+    });
+
     // Scheduled Time (Every hour check)
     this.intervalId = setInterval(
       () => this.processScheduledRules(),
@@ -50,9 +60,9 @@ class AutomationsPlugin {
     const article = await this.api.data.getArticle(guid);
     if (!article) return;
 
-    const result = await this.applyRulesToArticle(article, eventType);
+    const result = await this.applyRules(article, "article", eventType);
     if (result.modified) {
-      await this.api.data.saveArticle(result.article);
+      await this.api.data.saveArticle(result.target);
       this.api.app.refresh();
     }
   }
@@ -62,8 +72,8 @@ class AutomationsPlugin {
 
     const modifiedArticles = [];
     for (const article of articles) {
-      const result = await this.applyRulesToArticle(article, eventType);
-      modifiedArticles.push(result.article);
+      const result = await this.applyRules(article, "article", eventType);
+      modifiedArticles.push(result.target);
     }
     return modifiedArticles;
   }
@@ -76,9 +86,9 @@ class AutomationsPlugin {
     let modifiedCount = 0;
 
     for (const article of articles) {
-      const result = await this.applyRulesToArticle(article, "scheduled");
+      const result = await this.applyRules(article, "article", "scheduled");
       if (result.modified) {
-        await this.api.data.saveArticle(result.article);
+        await this.api.data.saveArticle(result.target);
         modifiedCount++;
       }
     }
@@ -88,41 +98,108 @@ class AutomationsPlugin {
     }
   }
 
-  evaluateCondition(condition, article) {
+  async processSingleFeedEvent(feed, eventType, extraContext) {
+    const result = await this.applyRules(feed, "feed", eventType, extraContext);
+    if (result.modified) {
+      await this.api.data.saveFeed(result.target);
+      this.api.app.refresh();
+    }
+  }
+
+  async evaluateCondition(condition, target, targetType, extraContext) {
     const value = condition.value ? condition.value.toLowerCase() : "";
-    const title = (article.title || "").toLowerCase();
-    const content = (
-      (article.content || "") +
-      " " +
-      (article.snippet || "")
-    ).toLowerCase();
-    const url = (article.link || "").toLowerCase();
 
     let isMatch = false;
     let matchContext = "";
 
-    switch (condition.field) {
-      case "title_contains":
-        isMatch = title.includes(value);
-        if (isMatch) matchContext = value;
-        break;
-      case "content_contains":
-        isMatch = content.includes(value);
-        if (isMatch) matchContext = value;
-        break;
-      case "url_contains":
-        isMatch = url.includes(value);
-        if (isMatch) matchContext = value;
-        break;
-      case "feed_is":
-        isMatch = article.feedId === condition.value;
-        break;
-      case "has_media":
-        isMatch = !!article.mediaType;
-        break;
-      case "always":
-        isMatch = true;
-        break;
+    if (condition.field === "always") {
+      isMatch = true;
+    } else if (condition.field === "date_check") {
+      const [operator, ...rest] = (condition.value || "").split(":");
+      const dateVal = rest.join(":");
+      const targetDate = new Date(
+        targetType === "article"
+          ? target.pubDate
+          : target.addedAt || Date.now(),
+      );
+      const now = new Date();
+
+      if (operator === "more_recent_than") {
+        const days = parseInt(dateVal, 10);
+        if (!isNaN(days)) {
+          const diffTime = Math.abs(now - targetDate);
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+          isMatch = diffDays <= days;
+        }
+      } else if (operator === "older_than") {
+        const days = parseInt(dateVal, 10);
+        if (!isNaN(days)) {
+          const diffTime = Math.abs(now - targetDate);
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+          isMatch = diffDays > days;
+        }
+      } else if (operator === "before") {
+        const compareDate = new Date(dateVal);
+        if (!isNaN(compareDate)) {
+          isMatch = targetDate < compareDate;
+        }
+      } else if (operator === "after") {
+        const compareDate = new Date(dateVal);
+        if (!isNaN(compareDate)) {
+          isMatch = targetDate > compareDate;
+        }
+      }
+    } else if (condition.field === "has_tag") {
+      let tags = [];
+      if (targetType === "feed") {
+        tags = target.tags || [];
+      } else if (targetType === "article") {
+        const feed = await this.api.data.getFeed(target.feedId);
+        if (feed) tags = feed.tags || [];
+      }
+      isMatch = tags.map((t) => t.toLowerCase()).includes(value);
+    } else if (targetType === "article") {
+      const title = (target.title || "").toLowerCase();
+      const content = (
+        (target.content || "") +
+        " " +
+        (target.snippet || "")
+      ).toLowerCase();
+      const url = (target.link || "").toLowerCase();
+
+      switch (condition.field) {
+        case "title_contains":
+          isMatch = title.includes(value);
+          if (isMatch) matchContext = value;
+          break;
+        case "content_contains":
+          isMatch = content.includes(value);
+          if (isMatch) matchContext = value;
+          break;
+        case "url_contains":
+          isMatch = url.includes(value);
+          if (isMatch) matchContext = value;
+          break;
+        case "feed_is":
+          isMatch = target.feedId === condition.value;
+          break;
+        case "has_media":
+          isMatch = !!target.mediaType;
+          break;
+      }
+    } else if (targetType === "feed") {
+      const title = (target.title || "").toLowerCase();
+      const url = (target.url || "").toLowerCase();
+      switch (condition.field) {
+        case "title_contains":
+          isMatch = title.includes(value);
+          if (isMatch) matchContext = value;
+          break;
+        case "url_contains":
+          isMatch = url.includes(value);
+          if (isMatch) matchContext = value;
+          break;
+      }
     }
 
     if (condition.invert) {
@@ -133,16 +210,26 @@ class AutomationsPlugin {
     return { isMatch, matchContext };
   }
 
-  replaceVariables(text, article, matchContext) {
+  replaceVariables(text, target, targetType, matchContext, extraContext) {
     if (!text) return "";
-    return text
-      .replace(/\{\{article\.title\}\}/g, article.title || "")
-      .replace(/\{\{article\.url\}\}/g, article.link || "")
-      .replace(/\{\{condition\.match\}\}/g, matchContext || "");
+    let res = text.replace(/\{\{condition\.match\}\}/g, matchContext || "");
+    if (targetType === "article") {
+      res = res
+        .replace(/\{\{article\.title\}\}/g, target.title || "")
+        .replace(/\{\{article\.url\}\}/g, target.link || "");
+    } else if (targetType === "feed") {
+      res = res
+        .replace(/\{\{feed\.title\}\}/g, target.title || "")
+        .replace(/\{\{feed\.url\}\}/g, target.url || "");
+    }
+    if (extraContext && extraContext.tag) {
+      res = res.replace(/\{\{tag\}\}/g, extraContext.tag || "");
+    }
+    return res;
   }
 
-  async applyRulesToArticle(article, eventType) {
-    let modifiedArticle = { ...article };
+  async applyRules(target, targetType, eventType, extraContext) {
+    let modifiedTarget = { ...target };
     let modified = false;
 
     for (const rule of this.rules) {
@@ -156,7 +243,14 @@ class AutomationsPlugin {
       } else {
         let matches = [];
         for (const cond of rule.conditions) {
-          matches.push(this.evaluateCondition(cond, modifiedArticle));
+          matches.push(
+            await this.evaluateCondition(
+              cond,
+              modifiedTarget,
+              targetType,
+              extraContext,
+            ),
+          );
         }
 
         if (rule.matchType === "any") {
@@ -180,35 +274,99 @@ class AutomationsPlugin {
         for (const action of rule.actions) {
           const actionValue = this.replaceVariables(
             action.value,
-            modifiedArticle,
+            modifiedTarget,
+            targetType,
             ruleMatchContext,
+            extraContext,
           );
 
           switch (action.type) {
             case "discard":
-              modifiedArticle.discarded = true;
-              modified = true;
+              if (targetType === "article") {
+                modifiedTarget.discarded = true;
+                modified = true;
+              }
               break;
             case "mark_read":
-              modifiedArticle.readingProgress = 1;
-              modifiedArticle.read = true;
-              modified = true;
+              if (targetType === "article") {
+                modifiedTarget.readingProgress = 1;
+                modifiedTarget.read = true;
+                modified = true;
+              }
               break;
             case "favorite":
-              modifiedArticle.favorite = true;
-              modified = true;
+              if (targetType === "article") {
+                modifiedTarget.favorite = true;
+                modified = true;
+              }
+              break;
+            case "add_tag":
+              if (targetType === "feed") {
+                if (!modifiedTarget.tags) modifiedTarget.tags = [];
+                if (!modifiedTarget.tags.includes(actionValue)) {
+                  modifiedTarget.tags.push(actionValue);
+                  modified = true;
+                }
+              } else if (targetType === "article") {
+                const feed = await this.api.data.getFeed(modifiedTarget.feedId);
+                if (feed) {
+                  if (!feed.tags) feed.tags = [];
+                  if (!feed.tags.includes(actionValue)) {
+                    feed.tags.push(actionValue);
+                    await this.api.data.saveFeed(feed);
+                    this.api.app.refresh();
+                  }
+                }
+              }
+              break;
+            case "remove_tag":
+              if (targetType === "feed") {
+                if (
+                  modifiedTarget.tags &&
+                  modifiedTarget.tags.includes(actionValue)
+                ) {
+                  modifiedTarget.tags = modifiedTarget.tags.filter(
+                    (t) => t !== actionValue,
+                  );
+                  modified = true;
+                }
+              } else if (targetType === "article") {
+                const feed = await this.api.data.getFeed(modifiedTarget.feedId);
+                if (feed && feed.tags && feed.tags.includes(actionValue)) {
+                  feed.tags = feed.tags.filter((t) => t !== actionValue);
+                  await this.api.data.saveFeed(feed);
+                  this.api.app.refresh();
+                }
+              }
               break;
             case "notify":
               this.api.ui.toast(
                 actionValue || `Automation: ${rule.name} triggered`,
               );
               break;
+            case "trigger_webhook":
+              try {
+                await fetch(actionValue, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    event: eventType,
+                    rule: rule.name,
+                    targetType,
+                    target: modifiedTarget,
+                    extraContext,
+                  }),
+                });
+              } catch (e) {
+                console.error("Webhook failed", e);
+              }
+              break;
           }
         }
       }
     }
 
-    return { article: modifiedArticle, modified };
+    return { target: modifiedTarget, modified };
   }
 
   emptyContainer(container) {
@@ -296,6 +454,8 @@ class AutomationsPlugin {
         new_article: "New Article Fetched",
         article_favorited: "Article Favorited",
         article_read: "Article Read",
+        feed_added: "Feed Added",
+        feed_tag_added: "Tag Added to Feed",
         scheduled: "Scheduled Time",
       };
 
@@ -376,6 +536,10 @@ class AutomationsPlugin {
       this.createOption("article_favorited", "Article Favorited"),
     );
     eventSelect.appendChild(this.createOption("article_read", "Article Read"));
+    eventSelect.appendChild(this.createOption("feed_added", "Feed Added"));
+    eventSelect.appendChild(
+      this.createOption("feed_tag_added", "Tag Added to Feed"),
+    );
     eventSelect.appendChild(
       this.createOption("scheduled", "Scheduled Time (Hourly)"),
     );
@@ -441,6 +605,8 @@ class AutomationsPlugin {
         select.appendChild(
           this.createOption("has_media", "Has Media (Audio/Video)"),
         );
+        select.appendChild(this.createOption("has_tag", "Has Tag"));
+        select.appendChild(this.createOption("date_check", "Date Check"));
         select.value = cond.field;
 
         const notBtn = document.createElement("button");
@@ -465,14 +631,68 @@ class AutomationsPlugin {
         feedSelect.value = cond.value;
         feedSelect.onchange = (e) => (cond.value = e.target.value);
 
+        const dateCheckContainer = document.createElement("div");
+        dateCheckContainer.className = "automation-row";
+        dateCheckContainer.style.flex = "1";
+        const dateOpSelect = document.createElement("select");
+        dateOpSelect.appendChild(
+          this.createOption("more_recent_than", "More recent than (days)"),
+        );
+        dateOpSelect.appendChild(
+          this.createOption("older_than", "Older than (days)"),
+        );
+        dateOpSelect.appendChild(this.createOption("before", "Before date"));
+        dateOpSelect.appendChild(this.createOption("after", "After date"));
+
+        const dateValInput = document.createElement("input");
+        dateValInput.type = "text";
+
+        let [dateOp, ...dateRest] = (cond.value || "").split(":");
+        if (
+          !["more_recent_than", "older_than", "before", "after"].includes(
+            dateOp,
+          )
+        ) {
+          dateOp = "more_recent_than";
+          dateRest = [""];
+        }
+        dateOpSelect.value = dateOp;
+        dateValInput.value = dateRest.join(":");
+
+        const updateDateValue = () => {
+          cond.value = `${dateOpSelect.value}:${dateValInput.value}`;
+        };
+        dateOpSelect.onchange = (e) => {
+          if (["before", "after"].includes(e.target.value)) {
+            dateValInput.type = "date";
+          } else {
+            dateValInput.type = "number";
+          }
+          updateDateValue();
+        };
+        dateValInput.oninput = updateDateValue;
+
+        if (["before", "after"].includes(dateOp)) {
+          dateValInput.type = "date";
+        } else {
+          dateValInput.type = "number";
+        }
+
+        dateCheckContainer.appendChild(dateOpSelect);
+        dateCheckContainer.appendChild(dateValInput);
+
         const updateInputs = () => {
           valInput.classList.add("automation-hidden");
           feedSelect.classList.add("automation-hidden");
+          dateCheckContainer.classList.add("automation-hidden");
 
           if (
-            ["title_contains", "content_contains", "url_contains"].includes(
-              select.value,
-            )
+            [
+              "title_contains",
+              "content_contains",
+              "url_contains",
+              "has_tag",
+            ].includes(select.value)
           ) {
             valInput.classList.remove("automation-hidden");
           } else if (select.value === "feed_is") {
@@ -483,6 +703,9 @@ class AutomationsPlugin {
             } else {
               feedSelect.value = cond.value;
             }
+          } else if (select.value === "date_check") {
+            dateCheckContainer.classList.remove("automation-hidden");
+            updateDateValue();
           } else {
             cond.value = "";
           }
@@ -501,10 +724,11 @@ class AutomationsPlugin {
           renderConditions();
         };
 
-        row.appendChild(select);
         row.appendChild(notBtn);
+        row.appendChild(select);
         row.appendChild(valInput);
         row.appendChild(feedSelect);
+        row.appendChild(dateCheckContainer);
         row.appendChild(delBtn);
 
         updateInputs();
@@ -553,19 +777,36 @@ class AutomationsPlugin {
         select.appendChild(this.createOption("discard", "Discard Article"));
         select.appendChild(this.createOption("mark_read", "Mark as Read"));
         select.appendChild(this.createOption("favorite", "Mark as Favorite"));
+        select.appendChild(this.createOption("add_tag", "Add Tag to Feed"));
+        select.appendChild(
+          this.createOption("remove_tag", "Remove Tag from Feed"),
+        );
         select.appendChild(this.createOption("notify", "Show Notification"));
+        select.appendChild(
+          this.createOption("trigger_webhook", "Trigger Webhook"),
+        );
         select.value = act.type;
 
         const valInput = document.createElement("input");
         valInput.type = "text";
-        valInput.placeholder = "Notification text... (use {{article.title}})";
+        valInput.placeholder = "Value...";
         valInput.value = act.value;
         valInput.oninput = (e) => (act.value = e.target.value);
 
         const updateInputs = () => {
           valInput.classList.add("automation-hidden");
-          if (select.value === "notify") {
+          if (
+            ["notify", "add_tag", "remove_tag", "trigger_webhook"].includes(
+              select.value,
+            )
+          ) {
             valInput.classList.remove("automation-hidden");
+            if (select.value === "notify")
+              valInput.placeholder =
+                "Notification text... (use {{article.title}})";
+            else if (select.value === "trigger_webhook")
+              valInput.placeholder = "Webhook URL...";
+            else valInput.placeholder = "Tag name...";
           } else {
             act.value = "";
           }

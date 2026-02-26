@@ -1,7 +1,7 @@
 {
   "id": "io.github.malom-ctrl.Automations",
   "name": "Automations",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Create automations based on events and conditions.",
   "compatibleAppVersion": ">=1.4.3",
   "files": ["main.js", "styles.css"]

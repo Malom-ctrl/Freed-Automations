@@ -115,14 +115,22 @@
 }
 
 .btn-not {
-    padding: 0.5rem 1rem;
+    padding: 0.25rem 0.25rem;
     border: 1px solid var(--border);
     border-radius: 4px;
     background: var(--bg-body);
     color: var(--text-muted);
     cursor: pointer;
     font-weight: 600;
+    font-size: 0.65rem;
     transition: all 0.2s;
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    transform: rotate(180deg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 36px;
 }
 
 .btn-not.active {
