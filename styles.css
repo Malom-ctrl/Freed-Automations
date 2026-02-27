@@ -115,7 +115,7 @@
 }
 
 .btn-not {
-    padding: 0.25rem 0.25rem;
+    padding: 0.5rem 0.25rem;
     border: 1px solid var(--border);
     border-radius: 4px;
     background: var(--bg-body);
@@ -135,7 +135,7 @@
 
 .btn-not.active {
     background: var(--primary);
-    color: white;
+    color: var(--text-inverse);
     border-color: var(--primary);
 }
 
